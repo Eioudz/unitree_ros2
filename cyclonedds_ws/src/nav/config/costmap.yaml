@@ -143,9 +143,13 @@ planner_server:
       allow_unknown: false
 
 # ---- 局部代价地图（滚动窗，挂在 controller_server 内）----
-# 2026-11-18 彻底去掉实时障碍：local costmap 只用最小 footprint + inflation，
-# 不订阅 /scan、不显示实时障碍。DWB 控制器只用作沿全局地图路径的跟踪器
-# （会订阅全局 costmap 生成的 /plan 路径），不再做任何雷达实时避障。
+# 2026-11-18 恢复局部实时障碍：local costmap 重新加入 obstacle_layer，订阅
+# /scan（livox_scan.py 产出，frame=base_link_level，~10Hz），把雷达看到的
+# 实时障碍标进滚动窗，再由 inflation_layer 膨胀出代价梯度。RViz 里能直接
+# 看到"点云障碍 -> 红色膨胀圈"随狗移动刷新。
+#   注意：livox_scan 的时间戳已在 11-18 改为贴近本机发布时刻，obstacle_layer
+#   按 scan.stamp 查 odom->base_link_level 不再 extrapolate-into-past 丢帧。
+#   全局 costmap 仍只用静态图（实时障碍只进局部，规划走预建墙 + 局部绕行）。
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -162,13 +166,43 @@ local_costmap:
       # 矩形 footprint（0.35x0.16m 外接，按狗真实体型 0.70x0.32m）：内切半径
       # 0.16m，0.35m+ 的缝隙可通过；设置 footprint 后 robot_radius 被忽略
       footprint: "[[0.35, 0.16], [0.35, -0.16], [-0.35, -0.16], [-0.35, 0.16]]"
-      # 局部代价地图加入 static_layer：从 /map 获取静态障碍，让 DWB 的 PathAlign/
-      # PathDist critics 能感知墙壁。纯 inflation_layer 无障碍源，costmap 全 0，
-      # DWB 只看路径偏差但不知道哪边有墙，路径跟踪方向感不足可能导致零速度输出。
-      plugins: ["static_layer", "inflation_layer"]
+      # 局部代价地图三层：static（预建墙）+ obstacle（/scan 实时障碍）+ inflation
+      # static_layer 让 DWB 的 PathAlign/PathDist critics 能感知墙壁；obstacle_layer
+      # 负责把雷达实时扫到的未建图障碍标进滚动窗，供 inflation 膨胀 + DWB 绕行。
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          # /scan 由 livox_scan 输出在 base_link_level（= robot_base_frame），
+          # 传感器原点与机器人体中心重合，高度带直接按机身水平面取
+          sensor_frame: base_link_level
+          data_type: "LaserScan"
+          # 只把"能绊到狗/挡到机身"的高度带当障碍：低于地面 -0.15 是地面
+          # 噪声，高于 0.35 是桌面以上（狗可从下方钻过，不应判为墙）
+          min_obstacle_height: -0.15
+          max_obstacle_height: 0.35
+          # 标记/清除都用射线：raytrace 让雷达扫过的空间被清空（动态障碍
+          # 走开后旧标记消失），否则静态残留会把通道堵死
+          marking: true
+          clearing: true
+          # 量程压到 4.0：局部窗只有 4x4m，中心到对角 2.83m，超出窗外的标记/
+          # 射线清除都会被裁掉，纯浪费 CPU（按 12m 做 raytrace 是 4m 的 3 倍
+          # 开销，11-04 的降载结论要求省 CPU）
+          raytrace_max_range: 4.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.0
+          obstacle_min_range: 0.55     # 与 livox_scan range_min 一致（屏蔽前腿自点）
+          # livox_scan 对空 bin 发 inf（publish_inf=True）。必须按有效量程处理：
+          # 当作 raytrace_max_range 参与清除，雷达扫过的空区域才会被清空。
+          # 若设 false，空 bin 被整条丢弃 -> 障碍走开后旧标记不消失，通道会
+          # 被历史障碍堵死。
+          inf_is_valid: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0

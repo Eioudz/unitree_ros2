@@ -25,7 +25,10 @@ import math
 
 import numpy as np
 import rclpy
+import rclpy.time
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan, PointCloud2
@@ -56,6 +59,9 @@ class LivoxScanNode(Node):
         self.declare_parameter('range_max', 12.0)
         self.declare_parameter('scan_bins', 720)  # 0.5°/bin
         self.declare_parameter('publish_inf', True)
+        # 多帧聚合窗口：0 = 不聚合（整帧驱动，推荐）；旧的小切片突发驱动
+        # 可设 0.09 把 ~60 片/帧凑回整帧
+        self.declare_parameter('aggregate_window_sec', 0.0)
 
         gp = self.get_parameter
         self.target = gp('target_frame').value
@@ -66,15 +72,29 @@ class LivoxScanNode(Node):
         self.bins = int(gp('scan_bins').value)
         self.use_inf = gp('publish_inf').value
 
-        # 切片聚合状态：狗端把 10Hz 帧切成 ~600Hz 小片突发到达（60 片/帧，
+        # 切片聚合状态：狗端曾把整帧切成 ~600Hz 小片突发到达（60 片/帧，
         # 每片 ~6° 扇区），逐片成 scan 会让 RViz 点云逐扇区闪烁 + 下游 60 倍
-        # 负载；按 90ms 窗口聚合变换后的切片点，凑整帧再发（10Hz 满密度）
+        # 负载，故按窗口聚合后再发。
+        # 2026-11-18：现网 Mid360 驱动已改发整帧（实测 227KB/帧、5.3Hz、
+        # 帧间隔 57~366ms），90ms 窗口会把间隔 <90ms 的两整帧并成一片，
+        # 直接把 5.3Hz 砍到 2.2Hz。窗口改为可配置且默认 0（不聚合）：
+        # 整帧到达即处理，聚合逻辑保留给"小切片突发"的旧驱动。
+        self.agg_window = Duration(
+            seconds=float(gp('aggregate_window_sec').value))
         self.agg_pts = []
         self.agg_n = 0        # 窗口内已累积点数
         self.agg_t0 = None    # 窗口首片 stamp -> scan 时间戳
         self.agg_wall = None  # 窗口起始墙钟
         self.agg_cap = 60000  # 单窗点数上限（整帧 ~2 万点，防异常流量撑内存）
 
+        # 点云回调放独立 callback group：本节点用 MultiThreadedExecutor，
+        # 点云回调（2 万点 numpy 运算）与 /tf 回调若共用默认的互斥组，会把
+        # TF 堵在队列后面，buffer 相对墙钟滞后可达数百 ms -> 按 now-40ms 查
+        # TF 报 extrapolation-into-the-future，整帧点云被丢弃。
+        # 实测症状：/livox/lidar 5Hz 而 /scan 只有 1.4Hz（warn 被 throttle 2s
+        # 掩盖，看着像偶发，实际是每帧都失败）；下游 AMCL 收不到扫描 ->
+        # map->odom 不更新 -> 代价地图冻结 -> DWB 每帧同一条轨迹 -> 原地绕圈。
+        self.cloud_group = MutuallyExclusiveCallbackGroup()
         self.tf_buf = Buffer(cache_time=Duration(seconds=30.0))
         TransformListener(self.tf_buf, self)
 
@@ -85,7 +105,8 @@ class LivoxScanNode(Node):
             LaserScan, gp('scan_topic').value,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
         self.create_subscription(
-            PointCloud2, gp('lidar_topic').value, self.cloud_cb, qos_profile_sensor_data)
+            PointCloud2, gp('lidar_topic').value, self.cloud_cb,
+            qos_profile_sensor_data, callback_group=self.cloud_group)
 
         self.get_logger().info(
             f'livox_scan: {gp("lidar_topic").value} -> {gp("scan_topic").value} '
@@ -101,13 +122,25 @@ class LivoxScanNode(Node):
         now = self.get_clock().now()
         t = (now - Duration(seconds=0.04)).to_msg()
 
-        # TF：livox_frame -> target（去俯仰水平坐标系），按 scan 时间戳精确查询
+        # TF：livox_frame -> target（去俯仰水平坐标系），按 scan 时间戳精确查询。
+        # 精确时刻查不到时（TF 尚未到达 / 已滑出 buffer）退到"最新可用变换"，
+        # 而不是丢弃整帧：0.5m/s 下车速下几帧的位姿偏差 < 数 cm，远小于
+        # range_min 0.55 的自点屏蔽余量，但丢帧会让 /scan 掉到 1/5 频率，
+        # 进而拖垮 AMCL->map->odom->costmap 整条链。
         try:
             tf = self.tf_buf.lookup_transform(self.target, msg.header.frame_id, t)
         except Exception as e:
-            self.get_logger().warn(f'TF lookup {msg.header.frame_id}->{self.target} fail: {e}',
-                                   throttle_duration_sec=2.0)
-            return
+            try:
+                tf = self.tf_buf.lookup_transform(
+                    self.target, msg.header.frame_id, rclpy.time.Time())
+                self.get_logger().warn(
+                    f'TF exact lookup failed ({type(e).__name__}), '
+                    f'used latest transform instead', throttle_duration_sec=5.0)
+            except Exception as e2:
+                self.get_logger().warn(
+                    f'TF lookup {msg.header.frame_id}->{self.target} fail: {e2}',
+                    throttle_duration_sec=2.0)
+                return
         tr = tf.transform.translation
         q = tf.transform.rotation
         R = quat_to_rotmat(q.x, q.y, q.z, q.w)
@@ -128,17 +161,17 @@ class LivoxScanNode(Node):
         # 变换到 target 坐标系：p' = R @ p + t（每片按各自到达时刻变换）
         tf_pts = xyz @ R.T + tvec
 
-        # 聚合窗口：首片记 t0，90ms 内累积，到期拼整帧走后续流程
-        # （运动中各片各自对齐 TF，累积仅 5cm 级拖影，AMCL 可忽略）
-        if self.agg_wall is None:
-            self.agg_t0, self.agg_wall = t, now
-        if self.agg_n < self.agg_cap:
-            self.agg_pts.append(tf_pts)
-            self.agg_n += tf_pts.shape[0]
-        if (now - self.agg_wall) < Duration(seconds=0.09):
-            return
-
-        tf_pts = np.concatenate(self.agg_pts)
+        # 聚合窗口（aggregate_window_sec，默认 0 = 不聚合）：首片记 t0，
+        # 窗口内累积，到期拼整帧走后续流程。整帧驱动下窗口为 0，每帧立即处理。
+        if self.agg_window.nanoseconds > 0:
+            if self.agg_wall is None:
+                self.agg_t0, self.agg_wall = t, now
+            if self.agg_n < self.agg_cap:
+                self.agg_pts.append(tf_pts)
+                self.agg_n += tf_pts.shape[0]
+            if (now - self.agg_wall) < self.agg_window:
+                return
+            tf_pts = np.concatenate(self.agg_pts)
         # 2026-11-18 修复：scan 时间戳必须贴近"发布时刻"，而非聚合窗口首片。
         # 首片 agg_t0 是主机收到点云的时刻（经无线中继已滞后 ~0.3s），加上 90ms
         # 聚合窗口，scan.stamp 平均比 odom TF（odom_tf_bridge 贴本机 now 发布）
@@ -183,11 +216,16 @@ class LivoxScanNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = LivoxScanNode()
+    # 多线程执行器：点云回调在 cloud_group 里跑，/tf 回调在默认组里跑，
+    # 两者不再互相排队（见 __init__ 中 cloud_group 的说明）
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()
 
