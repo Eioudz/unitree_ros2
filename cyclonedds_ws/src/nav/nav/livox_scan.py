@@ -59,9 +59,18 @@ class LivoxScanNode(Node):
         self.declare_parameter('range_max', 12.0)
         self.declare_parameter('scan_bins', 720)  # 0.5°/bin
         self.declare_parameter('publish_inf', True)
-        # 多帧聚合窗口：0 = 不聚合（整帧驱动）；>0 把"小切片突发"凑回整帧。
-        # launch 固化为 0.2（狗端驱动随时可能回退切片模式，见文件头说明）
-        self.declare_parameter('aggregate_window_sec', 0.0)
+        # 聚合参数（按"带内有回波的 bin 比例"凑帧）：
+        #   aggregate_min_coverage：组内累计到该比例的 bin 真有回波才发布
+        #   （0 = 每片即发）。计数口径必须是"高度带内、量程内"的回波，
+        #   不能数所有点的方位：地面/远点几乎铺满 360°，会让计数虚高、几十
+        #   毫秒就触发发布，而实际输出只有小半圈 -> RViz 逐帧重绘 = 闪烁。
+        #   aggregate_window_sec：组龄兜底，超时未凑满也发布并重开（防持续
+        #   遮挡/断流导致永远凑不满）
+        # 取值依据（domain 0 有线直连、2058Hz 全密度实测）：
+        #   0.70 / 0.5s -> 10.3Hz、覆盖率 70%、相邻两条重叠 86%
+        #   （重叠 31%->86% 是消除闪烁的关键；0.75 会把频率压到 5.9Hz）
+        self.declare_parameter('aggregate_min_coverage', 0.70)
+        self.declare_parameter('aggregate_window_sec', 0.5)
 
         gp = self.get_parameter
         self.target = gp('target_frame').value
@@ -72,20 +81,16 @@ class LivoxScanNode(Node):
         self.bins = int(gp('scan_bins').value)
         self.use_inf = gp('publish_inf').value
 
-        # 切片聚合状态：狗端 Mid360 驱动有两种发送模式，且会来回回退：
-        #   - 整帧直发：~5.3Hz，227KB/帧
-        #   - 小切片突发：~600Hz，60 片/帧（每片 ~6°），按 ~130ms 簇到达
-        # 切片模式下逐片成 scan 会让 RViz 逐扇区闪烁 + 下游 60 倍负载，
-        # 故按窗口聚合后再发。窗口取值必须 >= 簇周期+簇时长（0.2s），
-        # 否则窗口只撞上簇的零头 -> scan 只盖一小角扇区、其余 inf ->
-        # costmap clearing 把盲区障碍抹掉。整帧模式下只是把相邻帧并一帧，无害。
+        # 组聚合状态（按带内 bin 覆盖率凑帧）：group_ranges 滚动累积各 bin
+        # 最近回波，带内回波 bin 比例达 min_coverage 才发布，丢片/空窗时自动
+        # 跨帧补齐，保证相邻两条 /scan 高度重叠（闪烁的根源就是重叠太低）。
         # 诊断手册：docs/scan-rate-spike-diagnosis.md
+        self.min_cover = float(gp('aggregate_min_coverage').value)
         self.agg_window = Duration(
             seconds=float(gp('aggregate_window_sec').value))
-        self.agg_pts = []
-        self.agg_n = 0        # 窗口内已累积点数
-        self.agg_wall = None  # 窗口起始墙钟
-        self.agg_cap = 60000  # 单窗点数上限（整帧 ~2 万点，防异常流量撑内存）
+        self.group_ranges = np.full(
+            self.bins, np.inf if self.use_inf else self.rmax, dtype=np.float32)
+        self.group_t0 = None  # 组龄计时起点（首片到达时刻）
 
         # 点云回调放独立 callback group：本节点用 MultiThreadedExecutor，
         # 点云回调（2 万点 numpy 运算）与 /tf 回调若共用默认的互斥组，会把
@@ -173,53 +178,53 @@ class LivoxScanNode(Node):
         # 变换到 target 坐标系：p' = R @ p + t（每片按各自到达时刻变换）
         tf_pts = xyz @ R.T + tvec
 
-        # 聚合窗口（aggregate_window_sec，0 = 不聚合）：窗口内累积，
-        # 到期拼整帧走后续流程。整帧驱动下窗口为 0，每帧立即处理。
-        if self.agg_window.nanoseconds > 0:
-            if self.agg_wall is None:
-                self.agg_wall = now
-            if self.agg_n < self.agg_cap:
-                self.agg_pts.append(tf_pts)
-                self.agg_n += tf_pts.shape[0]
-            if (now - self.agg_wall) < self.agg_window:
-                return
-            tf_pts = np.concatenate(self.agg_pts)
-        # scan 时间戳必须贴近"发布时刻"，而非聚合窗口首片。首片时刻是主机收到
-        # 点云的时刻（经无线中继已滞后 ~0.3s），若用它作 stamp，obstacle_layer
-        # 按 scan.stamp 查 odom->base_link_level 时会超出 TF buffer 回溯范围，
-        # 报 extrapolate-into-past 丢帧 -> costmap 吃不到 /scan。
-        # 贴发布时刻后 scan.stamp 与 odom TF 对齐，obstacle_layer 能查到 TF。
-        # 移动场景下点云几何用"到达时 TF"，与最新 stamp 的错位 <0.4s*v
-        # （0.5m/s 时 <0.2m），由 costmap inflation_radius 0.55 兜底。
-        now = self.get_clock().now()
-        stamp = (now - Duration(seconds=0.04)).to_msg()
-        self.agg_pts, self.agg_n, self.agg_wall = [], 0, None
-
-        # 高度带过滤 -> 极坐标
+        # 高度带过滤 -> 极坐标 -> 投影到 bins（同 bin 取最近点），累积进组。
+        # 未过滤方向保持 inf：那是"看过但带内无障碍"= 真实自由空间，
+        # costmap 据此清理是正确行为。
+        inc = 2.0 * math.pi / self.bins
         mask = (tf_pts[:, 2] >= self.zmin) & (tf_pts[:, 2] <= self.zmax)
         hx, hy = tf_pts[mask, 0], tf_pts[mask, 1]
         rng = np.hypot(hx, hy)
         valid = (rng > self.rmin) & (rng < self.rmax)
         rng, ang = rng[valid], np.arctan2(hy[valid], hx[valid])
-
-        # 投影到 bins，同 bin 取最近点
-        inc = 2.0 * math.pi / self.bins
         idx = ((ang + math.pi) / inc).astype(np.int64) % self.bins
-        ranges = np.full(self.bins, np.inf if self.use_inf else self.rmax, dtype=np.float32)
-        np.minimum.at(ranges, idx, rng.astype(np.float32))
+        np.minimum.at(self.group_ranges, idx, rng.astype(np.float32))
 
-        out = LaserScan()
-        out.header.stamp = stamp
-        out.header.frame_id = self.target
-        out.angle_min = -math.pi
-        out.angle_max = math.pi
-        out.angle_increment = inc
-        out.time_increment = 0.0
-        out.scan_time = 0.1
-        out.range_min = self.rmin
-        out.range_max = self.rmax
-        out.ranges = ranges.tolist()
-        self.pub.publish(out)
+        if self.group_t0 is None:
+            self.group_t0 = now
+
+        # 覆盖率 = 带内真有回波的 bin 数（= group_ranges 里的有限值个数）。
+        # 必须按"输出的内容"计数：早期版本数的是所有点的方位（地面+远点铺满
+        # 360°，几十毫秒就凑满），于是每条 scan 只有小半圈有回波，相邻两条
+        # 重叠仅 31%，RViz 逐帧重绘 -> 一闪一闪。
+        covered = int(np.isfinite(self.group_ranges).sum()) if self.use_inf \
+            else int((self.group_ranges < self.rmax).sum())
+
+        # 发布：带内覆盖率达 min_coverage（丢片/空窗时自动跨帧凑满），
+        # 或组龄超 agg_window 兜底（防持续遮挡导致永远凑不满）。
+        if (covered >= self.min_cover * self.bins
+                or (now - self.group_t0) >= self.agg_window):
+            # scan.stamp 贴近发布时刻而非组首片时刻：obstacle_layer 按
+            # scan.stamp 查 odom->base_link_level，stamp 旧了会超出 TF
+            # buffer 回溯范围丢帧（extrapolate-into-past）；贴发布时刻与
+            # odom TF 对齐。移动时点云几何与 stamp 的错位 <0.4s*v
+            # （0.5m/s 时 <0.2m），由 costmap inflation_radius 兜底。
+            out = LaserScan()
+            out.header.stamp = (now - Duration(seconds=0.04)).to_msg()
+            out.header.frame_id = self.target
+            out.angle_min = -math.pi
+            out.angle_max = math.pi
+            out.angle_increment = inc
+            out.time_increment = 0.0
+            out.scan_time = 0.1
+            out.range_min = self.rmin
+            out.range_max = self.rmax
+            out.ranges = self.group_ranges.tolist()
+            self.pub.publish(out)
+            self.group_ranges = np.full(
+                self.bins, np.inf if self.use_inf else self.rmax,
+                dtype=np.float32)
+            self.group_t0 = None
 
 
 def main(args=None):

@@ -54,18 +54,14 @@ def generate_launch_description():
         executable='livox_scan.py',
         name='livox_scan',
         output='screen',
-        # 2026-11-20：狗端 Mid360 驱动又回到 ~600Hz 小切片突发模式（60 片/帧），
-        # 聚合窗口 0 时每片直接发一条 /scan，实测 459Hz -> AMCL/costmap 被淹没
-        # -> map->odom 停更 -> controller_server 刷 "Transform data too old"
-        # -> DWB 拿不到位姿，狗不动。
-        # 窗口取值（0.09->0.2）：实测切片按帧成簇突发（~60 片/34ms 簇，簇周期
-        # ~130ms）。90ms < 簇周期，部分窗口只撞上簇的零头 -> 该条 scan 只盖住
-        # 一小角扇区、其余 bins 全 inf -> costmap clearing 把"无回波"当自由
-        # 空间清理，盲区里的障碍被抹掉（局部代价地图障碍时有时无）。
-        # 0.2s >= 簇周期+簇时长，保证每条 scan 必含一个完整簇（360° 全覆盖），
-        # /scan 稳定 ~5Hz。整帧直发模式下只是把相邻两帧并一帧，无害。
-        # 根治：狗端驱动改回整帧直发（见 docs/scan-rate-spike-diagnosis.md）。
-        parameters=[{'aggregate_window_sec': 0.2}],
+        # 2026-11-20 按"带内回波覆盖率"凑帧（详细依据见 livox_scan.py 参数注释）：
+        # 计数口径是高度带内、量程内真有回波的 bin 比例，与 /scan 实际输出的
+        # 内容一致。0.70 是实测最优点——场景带内覆盖天花板约 78%，阈值设
+        # 0.95 会永远凑不满、每帧都等满 0.5s 兜底（/scan 恒 2Hz）。
+        # 实测（有线 domain 0、2058Hz 全密度）：0.70/0.5s -> 10.3Hz、覆盖 70%、
+        # 相邻两条重叠 86%；重叠率是闪烁的关键（旧逻辑只有 31%）。
+        parameters=[{'aggregate_min_coverage': 0.70,
+                     'aggregate_window_sec': 0.5}],
     )
 
     # Mid360 安装位静态 TF：背部官方支架，雷达向下倾 13°。

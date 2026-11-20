@@ -143,7 +143,8 @@ go2_description 侧另有：base_link -> base -> radar -> utlidar_lidar（厂商
 | `range_min` / `range_max` | 0.55 / 12.0 | 0.55 屏蔽前腿自点；12 实际没起作用（场景最远 7m） |
 | `scan_bins` | 720 | 角分辨率 |
 | `publish_inf` | true | 空 bin 发 inf（costmap 靠它做射线清除，**别关**） |
-| `aggregate_window_sec` | 0.0 | **launch 固化为 0.2**，见下 |
+| `aggregate_min_coverage` | 0.70 | **launch 固化为 0.70**，见下 |
+| `aggregate_window_sec` | 0.5 | 组龄兜底，超时未凑满也发布 |
 
 实现要点（改之前务必知道）：
 
@@ -153,15 +154,34 @@ go2_description 侧另有：base_link -> base -> radar -> utlidar_lidar（厂商
 - 发布 QoS 是 **BEST_EFFORT/depth=5**：RELIABLE 会被慢订阅者反压，消息排队后
   stamp 变旧，AMCL 直接丢（症状是 `/scan` 掉到 0.45Hz）。加 RELIABLE 订阅端要慎重。
 
-**`aggregate_window_sec` 是本包最容易复发的坑。** 狗端 Mid360 驱动会在
-"整帧直发（~5Hz）"和"~600Hz 小切片突发（60 片/帧）"之间回退，而本节点一片一 scan：
+**凑帧逻辑是本包最容易复发的坑。** 节点把多片点云累积成一个"组"，组内某 bin
+有回波就记下，**带内回波 bin 比例达 `aggregate_min_coverage` 才发布**，
+超时 `aggregate_window_sec` 兜底发布。狗端驱动会在"整帧直发（~5Hz）"和
+"~2058Hz 小切片突发（每片 85 点）"之间来回回退，这套凑帧两种模式都能出
+覆盖完整的 scan。
 
-- 窗口 0 + 切片模式 = `/scan` 数百 Hz -> AMCL/costmap 被淹没 -> `map->odom` 停更
-  -> `Transform data too old` -> 狗不动
-- 窗口 0.2s：切片按 ~130ms 簇突发，0.2s 能保证每条 scan 含完整一簇（360° 全覆盖），
-  稳定 ~5Hz。整帧模式下只是把相邻两帧并一帧，无害。
+调参时必须守住两条（都踩过）：
 
-**所以 launch 里写死 0.2，不要删。** 完整诊断流程见 `docs/scan-rate-spike-diagnosis.md`。
+1. **计数口径 = 输出内容**。只能数高度带内、量程内的回波 bin。若数"所有点的
+   方位"（地面回波 + 远点几乎铺满 360°），计数几十毫秒就满，而输出只有小半圈
+   -> 相邻两条 scan 重叠仅 31% -> RViz 一闪一闪。
+2. **先置位再数**。`cnt += (~covered[idx]).sum()` 这种"先数后置位"的写法，
+   同一片里多个点落在同一 bin 会重复计数，全密度下瞬间冲过阈值（实测 197Hz）。
+
+判据只有一个：**相邻两条 `/scan` 的重叠率**，低于 ~70% 就会闪。
+0.70/0.5s 在 2058Hz 下给出 10.3Hz、覆盖 70%、重叠 86%。
+完整诊断流程见 `docs/scan-rate-spike-diagnosis.md`。
+
+### 4.1.1 点云密度：走有线，别走中继
+
+| 链路 | `/livox/lidar` | 点数/秒 |
+|---|---|---|
+| 有线直连（domain 0，`enp130s0`） | 2058 Hz | 158000 |
+| WiFi 中继（domain 1） | 143~219 Hz | ~6500 |
+
+中继的 `RATE_SKIP=2` + `DOWNSAMPLE=2` 砍掉 3/4，而且 Python 中继扛不住
+2058Hz 的消息率（实测关掉抽样后狗 CPU 冲到 load 21，中继自身反而更慢）。
+**要完整点云就走有线 domain 0，不要试图改中继。**
 
 ### 4.2 `odom_tf_bridge.py` —— 里程计桥
 
@@ -215,7 +235,7 @@ DWB `min_vel_x: 0.0` + 本节点 `min_vx: 0.0` + `behavior_plugins` 无 `backup`
 
 | 节点 | 说明 |
 |---|---|
-| `livox_scan` | `aggregate_window_sec: 0.2`（硬编码在 launch 里） |
+| `livox_scan` | `aggregate_min_coverage: 0.70` + `aggregate_window_sec: 0.5`（硬编码在 launch 里） |
 | `livox_static_tf` | `base_link -> livox_frame`，`z=0.10`，`RPY(0, 13°, 0)`。**13° 是雷达安装俯仰**，去掉它会让切片平面斜 13°，把地面误投成立面鬼影 |
 | `odom_tf_bridge` | 全默认参数 |
 | `map_server` | `yaml_filename` 由 `map:=` 覆盖 |
@@ -291,8 +311,8 @@ recovery 轮换改为：清局部/全局 costmap -> `Spin(1.0rad)` -> `Wait(5s)`
 
 | 症状 | 先查 | 修法 |
 |---|---|---|
-| 狗完全不动，`controller_server` 刷 `Transform data too old when converting from map to odom` | `ros2 topic hz /scan` | 数百 Hz -> 看 §4.1 聚合窗口；正常 -> 看 `amcl.transform_tolerance`、狗时钟 |
-| `/scan` 数百 Hz | `ros2 topic hz /livox/lidar` + `ros2 param get /livox_scan aggregate_window_sec` | 狗端驱动回退切片模式，launch 里窗口 0.2 |
+| 狗完全不动，`controller_server` 刷 `Transform data too old when converting from map to odom` | `ros2 topic hz /scan` | 数百 Hz -> 看 §4.1 凑帧逻辑；正常 -> 看 `amcl.transform_tolerance`、狗时钟 |
+| `/scan` 频率异常 / RViz 闪烁 | `ros2 topic hz /scan`、相邻两条重叠率 | 见 §4.1：计数口径 + 先置位后数，阈值 0.70 |
 | `/scan` 掉到 1Hz 以下 / RViz 冻结 | QoS、`ros2 topic info /scan -v` | 发布端应 BEST_EFFORT；有 RELIABLE 慢订阅者会反压 |
 | 局部 costmap 全 0 | `ros2 topic hz /local_costmap/costmap`、`ros2 topic echo /scan --once` | `obstacle_layer` 是否在 plugins、`inf_is_valid: true`、scan stamp 是否太旧 |
 | 局部障碍时有时无 | 每条 scan 是否 360° 覆盖 | 聚合窗口 < 簇周期，改 0.2 |
@@ -318,7 +338,7 @@ pkill -f "rviz2 -d .*install/nav"
 ## 9. 验证清单
 
 ```bash
-ros2 topic hz /scan                      # ~5Hz（切片模式聚合后）/ ~5Hz（整帧）
+ros2 topic hz /scan                      # ~10Hz（有线 domain 0）/ ~5Hz（WiFi 中继）
 ros2 topic hz /odom_local                # ~150Hz
 ros2 topic hz /local_costmap/costmap     # ~1Hz
 ros2 topic hz /global_costmap/costmap    # ~0.5Hz
@@ -331,7 +351,7 @@ ros2 topic echo /api/sport/request --once
 
 ## 10. 已知限制 / 注意
 
-1. `/scan` 上限 ~5Hz 是狗端中继脚本 `RATE_SKIP` 决定的（10Hz 砍半 + 点云降采样），不在本仓库。
+1. 走 WiFi 中继时 `/scan` 密度上限由狗端 `RATE_SKIP`/`DOWNSAMPLE` 决定（砍到 ~6500 点/秒），不在本仓库；有线 domain 0 直连可拿到 15.8 万点/秒。
 2. 全局规划只用静态地图，实时障碍不进全局。
 3. 局部窗口 4×4m（±2m）是膨胀范围的实际上限，`range_max` 调到 12 没有意义。
 4. `rviz/localization.rviz` 的点云层默认 `Enabled: false`，看原始点云要手动勾选（topic 是 `/utlidar/cloud_base`，不是 `/livox/lidar`）。
