@@ -66,11 +66,10 @@ controller_server:
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
       stateful: true
-      # 2026-11-20 三次调整（原 0.25m/0.3rad -> 0.15/0.15 -> 现值）：距离收紧到
-      # 0.10m（真机精度 = 本容差 + AMCL 定位误差 ~0.1m，已到下限，再紧会在
-      # 定位噪声下原地抖动、判不到点）；朝向放宽回 0.3rad（≈17°）：位置到位
-      # 优先，goto_node 用进近方位角作目标朝向，本身偏差就小，无需苛求。
-      xy_goal_tolerance: 0.10
+      # 2026-11-16 收紧到点精度（原 0.4m/2π）：位置 0.25m，朝向恢复到 0.3rad
+      # （≈17°）。goto_node 现在用"机器人->目标"方位角作目标朝向，正常进近
+      # 时几乎不用原地补转；转速已恢复到 0.8rad/s，补转也能在限时内完成。
+      xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 0.3
     controller_plugins: ["FollowPath"]
     FollowPath:
@@ -105,7 +104,7 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
-      xy_goal_tolerance: 0.10    # 与 goal_checker 同步（2026-11-20 再收紧）
+      xy_goal_tolerance: 0.25    # 与 goal_checker 同步收紧（原 0.4）
       # 须低于 max_vel_x，否则前进中会被当作"已停"，RotateToGoal 提前介入
       trans_stopped_velocity: 0.15
       short_circuit_trajectory_evaluation: true
@@ -138,8 +137,8 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.15         # 目标点被占时，允许在 0.15m 邻域内给出替代点
-      # 与 goal_checker 的 0.10m 合并后最坏偏差约 0.25m（原 0.5+0.4=0.9m）
+      tolerance: 0.3          # 目标点被占时，允许在 0.3m 邻域内给出替代点
+      # 与 goal_checker 的 0.25m 合并后最坏偏差约 0.55m（原 0.5+0.4=0.9m）
       use_astar: false
       allow_unknown: false
 
