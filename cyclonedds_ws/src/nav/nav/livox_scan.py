@@ -59,18 +59,26 @@ class LivoxScanNode(Node):
         self.declare_parameter('range_max', 12.0)
         self.declare_parameter('scan_bins', 720)  # 0.5°/bin
         self.declare_parameter('publish_inf', True)
-        # 聚合参数（按"带内有回波的 bin 比例"凑帧）：
-        #   aggregate_min_coverage：组内累计到该比例的 bin 真有回波才发布
-        #   （0 = 每片即发）。计数口径必须是"高度带内、量程内"的回波，
-        #   不能数所有点的方位：地面/远点几乎铺满 360°，会让计数虚高、几十
-        #   毫秒就触发发布，而实际输出只有小半圈 -> RViz 逐帧重绘 = 闪烁。
-        #   aggregate_window_sec：组龄兜底，超时未凑满也发布并重开（防持续
-        #   遮挡/断流导致永远凑不满）
-        # 取值依据（domain 0 有线直连、2058Hz 全密度实测）：
-        #   0.70 / 0.5s -> 10.3Hz、覆盖率 70%、相邻两条重叠 86%
-        #   （重叠 31%->86% 是消除闪烁的关键；0.75 会把频率压到 5.9Hz）
+        # ---- 凑帧策略（两种，按链路密度自动选，launch 里配）----
+        # aggregate_mode:
+        #   'coverage'  组内累积，带内回波 bin 比例达 aggregate_min_coverage
+        #               才发布（高频点云用：有线 2058Hz，38ms 就凑满）
+        #   'sliding'   滑动窗口，每条 scan 都包含最近 aggregate_window_sec
+        #               的数据（低频点云用：中继 ~7000 点/秒，凑帧永远凑不满，
+        #               固定 0.5s 兜底会退化成 2Hz 且重叠只有 44%）
+        # 两种模式的共同目标：让相邻两条 /scan 高度重叠。重叠率是闪烁的唯一
+        # 判据（RViz 每帧擦掉重画，重叠 <70% 就肉眼可见地闪）。
+        self.declare_parameter('aggregate_mode', 'coverage')
+        # coverage 模式：带内回波 bin 比例阈值。计数口径必须是"高度带内、
+        # 量程内"的回波，不能数所有点的方位（地面/远点铺满 360° 会让计数
+        # 虚高，几十毫秒就发布、实际输出只有小半圈 -> 闪烁）。
         self.declare_parameter('aggregate_min_coverage', 0.70)
+        # coverage 模式：组龄兜底，超时未凑满也发布并重开。
+        # sliding 模式：滑动窗口时长（每条 scan 覆盖最近这么多秒的数据）。
         self.declare_parameter('aggregate_window_sec', 0.5)
+        # sliding 模式：固定发布频率。低频链路下必须固定频率发布，
+        # 否则频率会随点云到达抖动。
+        self.declare_parameter('sliding_publish_hz', 5.0)
 
         gp = self.get_parameter
         self.target = gp('target_frame').value
@@ -81,16 +89,19 @@ class LivoxScanNode(Node):
         self.bins = int(gp('scan_bins').value)
         self.use_inf = gp('publish_inf').value
 
-        # 组聚合状态（按带内 bin 覆盖率凑帧）：group_ranges 滚动累积各 bin
-        # 最近回波，带内回波 bin 比例达 min_coverage 才发布，丢片/空窗时自动
-        # 跨帧补齐，保证相邻两条 /scan 高度重叠（闪烁的根源就是重叠太低）。
-        # 诊断手册：docs/scan-rate-spike-diagnosis.md
+        # 凑帧状态。诊断手册：docs/scan-rate-spike-diagnosis.md
+        self.mode = str(gp('aggregate_mode').value)
         self.min_cover = float(gp('aggregate_min_coverage').value)
         self.agg_window = Duration(
             seconds=float(gp('aggregate_window_sec').value))
+        self.pub_hz = float(gp('sliding_publish_hz').value)
+        # coverage 模式：累积容器
         self.group_ranges = np.full(
             self.bins, np.inf if self.use_inf else self.rmax, dtype=np.float32)
         self.group_t0 = None  # 组龄计时起点（首片到达时刻）
+        # sliding 模式：滑动窗口内的切片 [(到达时刻, 变换后的点)] + 下次发布时刻
+        self.win = []
+        self.next_pub = None
 
         # 点云回调放独立 callback group：本节点用 MultiThreadedExecutor，
         # 点云回调（2 万点 numpy 运算）与 /tf 回调若共用默认的互斥组，会把
@@ -178,7 +189,7 @@ class LivoxScanNode(Node):
         # 变换到 target 坐标系：p' = R @ p + t（每片按各自到达时刻变换）
         tf_pts = xyz @ R.T + tvec
 
-        # 高度带过滤 -> 极坐标 -> 投影到 bins（同 bin 取最近点），累积进组。
+        # 高度带过滤 -> 极坐标 -> 投影到 bins（同 bin 取最近点）。
         # 未过滤方向保持 inf：那是"看过但带内无障碍"= 真实自由空间，
         # costmap 据此清理是正确行为。
         inc = 2.0 * math.pi / self.bins
@@ -188,8 +199,13 @@ class LivoxScanNode(Node):
         valid = (rng > self.rmin) & (rng < self.rmax)
         rng, ang = rng[valid], np.arctan2(hy[valid], hx[valid])
         idx = ((ang + math.pi) / inc).astype(np.int64) % self.bins
-        np.minimum.at(self.group_ranges, idx, rng.astype(np.float32))
 
+        if self.mode == 'sliding':
+            self._sliding(now, idx, rng, inc)
+            return
+
+        # ---- coverage 模式：累积到达标即发 ----
+        np.minimum.at(self.group_ranges, idx, rng.astype(np.float32))
         if self.group_t0 is None:
             self.group_t0 = now
 
@@ -204,27 +220,58 @@ class LivoxScanNode(Node):
         # 或组龄超 agg_window 兜底（防持续遮挡导致永远凑不满）。
         if (covered >= self.min_cover * self.bins
                 or (now - self.group_t0) >= self.agg_window):
-            # scan.stamp 贴近发布时刻而非组首片时刻：obstacle_layer 按
-            # scan.stamp 查 odom->base_link_level，stamp 旧了会超出 TF
-            # buffer 回溯范围丢帧（extrapolate-into-past）；贴发布时刻与
-            # odom TF 对齐。移动时点云几何与 stamp 的错位 <0.4s*v
-            # （0.5m/s 时 <0.2m），由 costmap inflation_radius 兜底。
-            out = LaserScan()
-            out.header.stamp = (now - Duration(seconds=0.04)).to_msg()
-            out.header.frame_id = self.target
-            out.angle_min = -math.pi
-            out.angle_max = math.pi
-            out.angle_increment = inc
-            out.time_increment = 0.0
-            out.scan_time = 0.1
-            out.range_min = self.rmin
-            out.range_max = self.rmax
-            out.ranges = self.group_ranges.tolist()
-            self.pub.publish(out)
+            self._publish(now, self.group_ranges, inc)
             self.group_ranges = np.full(
                 self.bins, np.inf if self.use_inf else self.rmax,
                 dtype=np.float32)
             self.group_t0 = None
+
+    def _sliding(self, now, idx, rng, inc):
+        """滑动窗口模式：每条 scan 都覆盖最近 agg_window 秒的全部数据。
+
+        低频链路（WiFi 中继 ~7000 点/秒）下，coverage 模式永远凑不满阈值，
+        只能等满超时兜底 -> 2Hz 且相邻重叠仅 44%（仍然闪）。滑动窗口让相邻
+        两条共享窗口内绝大部分数据，重叠率天然很高（实测 T=0.6s/5Hz -> 73%），
+        且频率固定不随点云到达抖动。
+        代价：移动时窗口内包含数百毫秒前的点，会有拖影；由 costmap 的
+        inflation_radius 和 AMCL 的 update_min_d 兜底，中继链路本就做不到高频。
+        """
+        self.win.append((now, idx, rng.astype(np.float32)))
+        # 丢弃滑出窗口的切片
+        cutoff = now - self.agg_window
+        while self.win and self.win[0][0] < cutoff:
+            self.win.pop(0)
+
+        if self.next_pub is None:
+            self.next_pub = now
+        if now < self.next_pub:
+            return
+        self.next_pub = now + Duration(seconds=1.0 / self.pub_hz)
+
+        ranges = np.full(
+            self.bins, np.inf if self.use_inf else self.rmax, dtype=np.float32)
+        for _, i, r in self.win:
+            np.minimum.at(ranges, i, r)
+        self._publish(now, ranges, inc)
+
+    def _publish(self, now, ranges, inc):
+        # scan.stamp 贴近发布时刻而非组首片时刻：obstacle_layer 按
+        # scan.stamp 查 odom->base_link_level，stamp 旧了会超出 TF
+        # buffer 回溯范围丢帧（extrapolate-into-past）；贴发布时刻与
+        # odom TF 对齐。移动时点云几何与 stamp 的错位 <0.4s*v
+        # （0.5m/s 时 <0.2m），由 costmap inflation_radius 兜底。
+        out = LaserScan()
+        out.header.stamp = (now - Duration(seconds=0.04)).to_msg()
+        out.header.frame_id = self.target
+        out.angle_min = -math.pi
+        out.angle_max = math.pi
+        out.angle_increment = inc
+        out.time_increment = 0.0
+        out.scan_time = 0.1
+        out.range_min = self.rmin
+        out.range_max = self.rmax
+        out.ranges = ranges.tolist()
+        self.pub.publish(out)
 
 
 def main(args=None):

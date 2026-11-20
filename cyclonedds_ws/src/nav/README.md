@@ -4,7 +4,8 @@ Go2 四足真机的 **定位 + Nav2 导航栈 + 运动指令桥接 + 语义单�
 本文件是包的"地图"：数据流、每个文件负责什么、参数在哪、出问题先看哪。
 
 > 历史排查细节见包内 `NAV_FIX_2026-11-18.md`、`LOCAL_COSTMAP_2026-11-18.md`
-> 和仓库 `docs/scan-rate-spike-diagnosis.md`、`docs/rviz-freeze-diagnosis.md`。
+> 和仓库 `docs/scan-rate-spike-diagnosis.md`、`docs/scan-flicker-diagnosis.md`、
+> `docs/rviz-freeze-diagnosis.md`。
 > 那几份是"某天发生了什么"，本文件是"现在是什么样"。
 
 ---
@@ -143,8 +144,10 @@ go2_description 侧另有：base_link -> base -> radar -> utlidar_lidar（厂商
 | `range_min` / `range_max` | 0.55 / 12.0 | 0.55 屏蔽前腿自点；12 实际没起作用（场景最远 7m） |
 | `scan_bins` | 720 | 角分辨率 |
 | `publish_inf` | true | 空 bin 发 inf（costmap 靠它做射线清除，**别关**） |
-| `aggregate_min_coverage` | 0.70 | **launch 固化为 0.70**，见下 |
-| `aggregate_window_sec` | 0.5 | 组龄兜底，超时未凑满也发布 |
+| `aggregate_mode` | `coverage` | 凑帧策略：`coverage`（凑满阈值发）/ `sliding`（滑动窗口），**launch 按 domain 自动选** |
+| `aggregate_min_coverage` | 0.70 | coverage 模式的带内回波 bin 比例阈值 |
+| `aggregate_window_sec` | 0.5 | coverage 模式：组龄兜底；sliding 模式：窗口时长 |
+| `sliding_publish_hz` | 5.0 | sliding 模式的固定发布频率 |
 
 实现要点（改之前务必知道）：
 
@@ -154,13 +157,18 @@ go2_description 侧另有：base_link -> base -> radar -> utlidar_lidar（厂商
 - 发布 QoS 是 **BEST_EFFORT/depth=5**：RELIABLE 会被慢订阅者反压，消息排队后
   stamp 变旧，AMCL 直接丢（症状是 `/scan` 掉到 0.45Hz）。加 RELIABLE 订阅端要慎重。
 
-**凑帧逻辑是本包最容易复发的坑。** 节点把多片点云累积成一个"组"，组内某 bin
-有回波就记下，**带内回波 bin 比例达 `aggregate_min_coverage` 才发布**，
-超时 `aggregate_window_sec` 兜底发布。狗端驱动会在"整帧直发（~5Hz）"和
-"~2058Hz 小切片突发（每片 85 点）"之间来回回退，这套凑帧两种模式都能出
-覆盖完整的 scan。
+**凑帧逻辑是本包最容易复发的坑。** 两种模式的目标都是同一个：让相邻两条
+`/scan` 高度重叠。**判据只有重叠率**，低于 ~70% 就会闪。
 
-调参时必须守住两条（都踩过）：
+| 模式 | 做法 | 适用 | 实测 |
+|---|---|---|---|
+| `coverage` | 累积多片，带内回波 bin 达阈值才发 | 高频点云（有线 2058Hz） | 10.3Hz / 覆盖 70% / 重叠 86% |
+| `sliding` | 每条都含最近 T 秒全部数据，固定频率发 | 低频点云（中继 ~7000 点/秒） | 5.0Hz / 覆盖 58% / 重叠 87% |
+
+低频链路**不要硬凑阈值**：中继链路带内只有约 1000 点/秒，凑满 70% 需要 >0.5s，
+coverage 模式会退化成 2Hz 且重叠仅 44%（仍然闪）。滑动窗口的重叠率不依赖数据密度。
+
+改 coverage 模式时必须守住两条（都踩过）：
 
 1. **计数口径 = 输出内容**。只能数高度带内、量程内的回波 bin。若数"所有点的
    方位"（地面回波 + 远点几乎铺满 360°），计数几十毫秒就满，而输出只有小半圈
@@ -168,20 +176,22 @@ go2_description 侧另有：base_link -> base -> radar -> utlidar_lidar（厂商
 2. **先置位再数**。`cnt += (~covered[idx]).sum()` 这种"先数后置位"的写法，
    同一片里多个点落在同一 bin 会重复计数，全密度下瞬间冲过阈值（实测 197Hz）。
 
-判据只有一个：**相邻两条 `/scan` 的重叠率**，低于 ~70% 就会闪。
-0.70/0.5s 在 2058Hz 下给出 10.3Hz、覆盖 70%、重叠 86%。
-完整诊断流程见 `docs/scan-rate-spike-diagnosis.md`。
+> 这些参数**运行时 `ros2 param set` 不生效**（`__init__` 只读一次），改完要重启 launch。
+> 完整诊断流程见 `docs/scan-flicker-diagnosis.md`。
 
-### 4.1.1 点云密度：走有线，别走中继
+### 4.1.1 点云密度：有线 vs 中继
 
-| 链路 | `/livox/lidar` | 点数/秒 |
-|---|---|---|
-| 有线直连（domain 0，`enp130s0`） | 2058 Hz | 158000 |
-| WiFi 中继（domain 1） | 143~219 Hz | ~6500 |
+| 链路 | domain | `/livox/lidar` | 点数/秒 | 凑帧模式 |
+|---|---|---|---|---|
+| 有线直连 `enp130s0` | 0 | 2058 Hz | 158000 | `coverage` 0.70 |
+| WiFi 中继 | 1 | ~190 Hz | ~7000（带内 ~1000） | `sliding` 0.6s/5Hz |
+
+`setup.sh` 按网卡自动设 `ROS_DOMAIN_ID`，launch 据此选模式并在启动日志打印。
+**插拔网线后必须重启 launch**（domain 是进程启动时读的环境变量）。
 
 中继的 `RATE_SKIP=2` + `DOWNSAMPLE=2` 砍掉 3/4，而且 Python 中继扛不住
 2058Hz 的消息率（实测关掉抽样后狗 CPU 冲到 load 21，中继自身反而更慢）。
-**要完整点云就走有线 domain 0，不要试图改中继。**
+**要完整点云就走有线，不要试图改中继。**
 
 ### 4.2 `odom_tf_bridge.py` —— 里程计桥
 
@@ -235,7 +245,7 @@ DWB `min_vel_x: 0.0` + 本节点 `min_vx: 0.0` + `behavior_plugins` 无 `backup`
 
 | 节点 | 说明 |
 |---|---|
-| `livox_scan` | `aggregate_min_coverage: 0.70` + `aggregate_window_sec: 0.5`（硬编码在 launch 里） |
+| `livox_scan` | 按 domain 自动选：有线 `coverage` 0.70 / 中继 `sliding` 0.6s+5Hz（见 §4.1） |
 | `livox_static_tf` | `base_link -> livox_frame`，`z=0.10`，`RPY(0, 13°, 0)`。**13° 是雷达安装俯仰**，去掉它会让切片平面斜 13°，把地面误投成立面鬼影 |
 | `odom_tf_bridge` | 全默认参数 |
 | `map_server` | `yaml_filename` 由 `map:=` 覆盖 |

@@ -49,19 +49,44 @@ def generate_launch_description():
     map_yaml = LaunchConfiguration('map')
 
     # 1. Mid360 点云切片（stamp 重打为本机时钟 + 去俯仰水平切片）
+    #
+    # 凑帧策略按链路密度自动选（见 livox_scan.py 的 aggregate_mode 说明）。
+    # 两条链路的点云密度差 20 倍以上，同一套参数无法兼顾：
+    #
+    #   domain 0（有线直连狗固件）  2058Hz / 15.8 万点/秒
+    #     -> coverage 模式：38ms 就凑满 95% 方位。用 0.70/0.5s 实测 10.3Hz、
+    #        覆盖 70%、相邻重叠 86%。
+    #
+    #   domain 1（WiFi 中继）       ~190Hz / 7000 点/秒，带内仅约 1000 点/秒
+    #     -> coverage 模式永远凑不满（带内覆盖天花板 ~40%），只能每帧等满
+    #        0.5s 兜底：2Hz、重叠 44%，仍然闪。
+    #     -> 改用 sliding 模式（滑动窗口）：T=0.6s / 5Hz 实测覆盖 44%、
+    #        相邻重叠 73%，频率固定不抖。
+    #
+    # setup.sh 按网卡自动设 ROS_DOMAIN_ID（有线 enp -> 0，WiFi wlp -> 1），
+    # 所以这里读环境变量即可跟着网络切换走。
+    _domain = os.environ.get('ROS_DOMAIN_ID', '0')
+    if _domain == '1':
+        _scan_params = {
+            'aggregate_mode': 'sliding',
+            'aggregate_window_sec': 0.6,
+            'sliding_publish_hz': 5.0,
+        }
+    else:
+        _scan_params = {
+            'aggregate_mode': 'coverage',
+            'aggregate_min_coverage': 0.70,
+            'aggregate_window_sec': 0.5,
+        }
+    print('[localization.launch] ROS_DOMAIN_ID=%s -> livox_scan %s'
+          % (_domain, _scan_params))
+
     livox_scan = Node(
         package='nav',
         executable='livox_scan.py',
         name='livox_scan',
         output='screen',
-        # 2026-11-20 按"带内回波覆盖率"凑帧（详细依据见 livox_scan.py 参数注释）：
-        # 计数口径是高度带内、量程内真有回波的 bin 比例，与 /scan 实际输出的
-        # 内容一致。0.70 是实测最优点——场景带内覆盖天花板约 78%，阈值设
-        # 0.95 会永远凑不满、每帧都等满 0.5s 兜底（/scan 恒 2Hz）。
-        # 实测（有线 domain 0、2058Hz 全密度）：0.70/0.5s -> 10.3Hz、覆盖 70%、
-        # 相邻两条重叠 86%；重叠率是闪烁的关键（旧逻辑只有 31%）。
-        parameters=[{'aggregate_min_coverage': 0.70,
-                     'aggregate_window_sec': 0.5}],
+        parameters=[_scan_params],
     )
 
     # Mid360 安装位静态 TF：背部官方支架，雷达向下倾 13°。
