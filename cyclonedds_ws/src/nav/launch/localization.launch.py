@@ -54,6 +54,13 @@ def generate_launch_description():
         executable='livox_scan.py',
         name='livox_scan',
         output='screen',
+        # 2026-11-20：狗端 Mid360 驱动又回到 ~600Hz 小切片突发模式（60 片/帧），
+        # 聚合窗口 0 时每片直接发一条 /scan，实测 459Hz -> AMCL/costmap 被淹没
+        # -> map->odom 停更 -> controller_server 刷 "Transform data too old"
+        # -> DWB 拿不到位姿，狗不动。重开 90ms 窗口把切片凑回 ~10Hz。
+        # 若狗端驱动恢复整帧直发（帧间隔 57~366ms），此窗口会把间隔 <90ms 的
+        # 两帧并成一帧（频率降至 ~3-8Hz，仍可用）；根治办法是狗端改回整帧。
+        parameters=[{'aggregate_window_sec': 0.09}],
     )
 
     # Mid360 安装位静态 TF：背部官方支架，雷达向下倾 13°。
