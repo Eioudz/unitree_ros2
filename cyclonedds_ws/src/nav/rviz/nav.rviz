@@ -101,7 +101,7 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /scan
     - Class: rviz_default_plugins/PoseArray
-      Enabled: true
+      Enabled: false
       Name: ParticleCloud
       Color: 0; 180; 0
       Arrow Length: 0.3
@@ -136,7 +136,7 @@ Visualization Manager:
     Background Color: 48; 48; 48
     Default Light: true
     Fixed Frame: map
-    Frame Rate: 30
+    Frame Rate: 10
   Name: root
   Tools:
     - Class: rviz_default_plugins/MoveCamera

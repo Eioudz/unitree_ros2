@@ -50,11 +50,15 @@ amcl:
     # initial_pose.y: 0.0
     # initial_pose.yaw: 0.0
 
-    # map->odom 时间戳容忍度：scan stamp 经无线中继+聚合窗口后比 TF 发布时刻
-    # 晚 ~0.3-0.4s，0.1s 的 tolerance 会导致 RViz/costmap 按 scan.stamp 查
-    # map->odom TF 时报 extrapolation 丢帧（2D Pose Estimate 后点云显示慢的根因）。
-    # 时钟已同步到狗（差 <0.5s），1.0s 足够覆盖网络抖动+聚合延迟。
-    transform_tolerance: 1.0
+    # map->odom 时间戳容忍度：AMCL 会把 map->odom 的 stamp 往后打这个值，
+    # 供下游按"未来时刻"查询（TF 不允许查未来，只能靠提前发布覆盖）。
+    # 2026-11-19：1.0 实测让 map->odom 的 stamp 超前本机时钟 +0.95s，正好卡在
+    # controller_server / RViz 能接受的上限；链路一抖动就变成
+    # "Transform data too old when converting from map to odom"，DWB 拿不到
+    # 位姿 -> 一帧 /cmd_vel 都不发 -> 狗不动（11-18/11-19 多次复现）。
+    # 降到 0.5：仍覆盖无线中继的 scan 延迟（实测 0.1-0.3s），但给下游留出
+    # 余量，不再贴着临界值跑。
+    transform_tolerance: 0.5
     tf_broadcast: true
     resample_interval: 1
     save_pose_rate: 0.5

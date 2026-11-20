@@ -98,12 +98,24 @@ class LivoxScanNode(Node):
         self.tf_buf = Buffer(cache_time=Duration(seconds=30.0))
         TransformListener(self.tf_buf, self)
 
-        # 发布 RELIABLE：/scan 仅 3KB/帧，走无线中继时其中继订阅端固定
-        # RELIABLE（BEST_EFFORT pub 与之不匹配会静默收不到）；笔记本端
-        # slam_toolbox 的 BEST_EFFORT 订阅与 RELIABLE pub 兼容
+        # 发布 BEST_EFFORT（2026-11-19 修）：此前是 RELIABLE/depth=10，只要
+        # 出现一个慢订阅者（ros2 topic hz、RViz 的 LaserScan 显示、被反压的
+        # 代价地图），CycloneDDS 就会对 RELIABLE writer 施加反压：publish()
+        # 阻塞、消息在 writer 队列里排队，等真正送达时 header.stamp 已经旧了
+        # 好几秒。AMCL 的 MessageFilter 拿到这种陈旧 scan 直接丢弃
+        # （"the timestamp on the message is earlier than all the data in the
+        # transform cache"）-> map->odom 停止更新 -> controller_server 刷
+        # "Transform data too old when converting from map to odom" -> DWB 拿
+        # 不到机器人位姿、一帧 /cmd_vel 都不发 -> 狗不动。RViz 侧同源症状是
+        # "Message Filter dropping message: frame 'odom' ... queue is full"。
+        # 实测对照：RELIABLE 订阅 /scan 只有 0.45Hz，BEST_EFFORT 订阅 4.8Hz
+        # （= 点云输入频率），且 BEST_EFFORT 下 scan.stamp 不再冻结。
+        # 传感器话题本就该"宁可丢旧帧，也不排队"，故改为 BEST_EFFORT/depth=5。
+        # 现网所有订阅端（amcl、local_costmap、RViz、slam_toolbox）均为
+        # BEST_EFFORT，与之匹配；若将来有 RELIABLE 订阅端需另行调整。
         self.pub = self.create_publisher(
             LaserScan, gp('scan_topic').value,
-            QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
+            QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.create_subscription(
             PointCloud2, gp('lidar_topic').value, self.cloud_cb,
             qos_profile_sensor_data, callback_group=self.cloud_group)

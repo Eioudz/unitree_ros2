@@ -56,12 +56,18 @@ def generate_launch_description():
         output='screen',
     )
 
-    # Mid360 安装位静态 TF（与 slam.launch.py 一致：背部官方支架）
+    # Mid360 安装位静态 TF：背部官方支架，雷达向下倾 13°。
+    # 四元数 = RPY(0, +13°, 0) 即 base_link 相对 livox 后仰 13°，
+    # 等效 livox 相对 base_link 前倾 13°。之前此处为零旋转，导致
+    # livox_scan 的 z[-0.15,0.35] 切片在真实世界里是向前上方斜 13° 的带，
+    # 把前方 1~3m 的地面误投为 z≈0.24*r-0.42 的"立面"（鬼影障碍），
+    # 远处(>3m)则被 max_height 滤掉，前方反而空。
     livox_static_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='livox_static_tf',
-        arguments=['0', '0', '0.10', '0', '0', '0', '1', 'base_link', 'livox_frame'],
+        arguments=['0', '0', '0.10', '0', '0.1132032', '0', '0.9935719',
+                   'base_link', 'livox_frame'],
     )
 
     # 2. LIO 里程计 -> TF: odom->base_link / odom->base_link_level
