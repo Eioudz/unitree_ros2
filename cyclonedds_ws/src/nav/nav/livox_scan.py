@@ -4,9 +4,9 @@ Mid360 点云切片节点（时间戳对齐 + 水平切片二合一，替代 liv
 pointcloud_to_laserscan 组合）。
 
 为什么自己写：
-1. 时钟域问题：/utlidar/robot_odom（TF 源）的 stamp 是狗主控时钟域（慢约
-   163 天），AMCL/Nav2/RViz 用本机时钟查 TF 跨域必挂 -> odom_tf_bridge 与本
-   节点统一把 stamp 重打为本机时钟，全链路（TF/scan/AMCL/Nav2）同源自洽。
+1. 时钟域问题：/utlidar/robot_odom（TF 源）的 stamp 是狗主控时钟域，与笔记本
+   不同步时 AMCL/Nav2/RViz 用本机时钟查 TF 必挂 -> odom_tf_bridge 与本节点
+   统一把 stamp 重打为本机时钟，全链路（TF/scan/AMCL/Nav2）同源自洽。
 2. pointcloud_to_laserscan 包在 launch 方式下实测时好时坏：参数生效、订阅
    存在、QoS 兼容，却静默无输出（Node 与 ExecuteProcess 两种方式均复现，
    手动 ros2 run 则 100% 正常），不可依赖 -> 自研切片逻辑完全可控。
@@ -59,8 +59,8 @@ class LivoxScanNode(Node):
         self.declare_parameter('range_max', 12.0)
         self.declare_parameter('scan_bins', 720)  # 0.5°/bin
         self.declare_parameter('publish_inf', True)
-        # 多帧聚合窗口：0 = 不聚合（整帧驱动，推荐）；旧的小切片突发驱动
-        # 可设 0.09 把 ~60 片/帧凑回整帧
+        # 多帧聚合窗口：0 = 不聚合（整帧驱动）；>0 把"小切片突发"凑回整帧。
+        # launch 固化为 0.2（狗端驱动随时可能回退切片模式，见文件头说明）
         self.declare_parameter('aggregate_window_sec', 0.0)
 
         gp = self.get_parameter
@@ -72,18 +72,18 @@ class LivoxScanNode(Node):
         self.bins = int(gp('scan_bins').value)
         self.use_inf = gp('publish_inf').value
 
-        # 切片聚合状态：狗端曾把整帧切成 ~600Hz 小片突发到达（60 片/帧，
-        # 每片 ~6° 扇区），逐片成 scan 会让 RViz 点云逐扇区闪烁 + 下游 60 倍
-        # 负载，故按窗口聚合后再发。
-        # 2026-11-18：现网 Mid360 驱动已改发整帧（实测 227KB/帧、5.3Hz、
-        # 帧间隔 57~366ms），90ms 窗口会把间隔 <90ms 的两整帧并成一片，
-        # 直接把 5.3Hz 砍到 2.2Hz。窗口改为可配置且默认 0（不聚合）：
-        # 整帧到达即处理，聚合逻辑保留给"小切片突发"的旧驱动。
+        # 切片聚合状态：狗端 Mid360 驱动有两种发送模式，且会来回回退：
+        #   - 整帧直发：~5.3Hz，227KB/帧
+        #   - 小切片突发：~600Hz，60 片/帧（每片 ~6°），按 ~130ms 簇到达
+        # 切片模式下逐片成 scan 会让 RViz 逐扇区闪烁 + 下游 60 倍负载，
+        # 故按窗口聚合后再发。窗口取值必须 >= 簇周期+簇时长（0.2s），
+        # 否则窗口只撞上簇的零头 -> scan 只盖一小角扇区、其余 inf ->
+        # costmap clearing 把盲区障碍抹掉。整帧模式下只是把相邻帧并一帧，无害。
+        # 诊断手册：docs/scan-rate-spike-diagnosis.md
         self.agg_window = Duration(
             seconds=float(gp('aggregate_window_sec').value))
         self.agg_pts = []
         self.agg_n = 0        # 窗口内已累积点数
-        self.agg_t0 = None    # 窗口首片 stamp -> scan 时间戳
         self.agg_wall = None  # 窗口起始墙钟
         self.agg_cap = 60000  # 单窗点数上限（整帧 ~2 万点，防异常流量撑内存）
 
@@ -173,30 +173,27 @@ class LivoxScanNode(Node):
         # 变换到 target 坐标系：p' = R @ p + t（每片按各自到达时刻变换）
         tf_pts = xyz @ R.T + tvec
 
-        # 聚合窗口（aggregate_window_sec，默认 0 = 不聚合）：首片记 t0，
-        # 窗口内累积，到期拼整帧走后续流程。整帧驱动下窗口为 0，每帧立即处理。
+        # 聚合窗口（aggregate_window_sec，0 = 不聚合）：窗口内累积，
+        # 到期拼整帧走后续流程。整帧驱动下窗口为 0，每帧立即处理。
         if self.agg_window.nanoseconds > 0:
             if self.agg_wall is None:
-                self.agg_t0, self.agg_wall = t, now
+                self.agg_wall = now
             if self.agg_n < self.agg_cap:
                 self.agg_pts.append(tf_pts)
                 self.agg_n += tf_pts.shape[0]
             if (now - self.agg_wall) < self.agg_window:
                 return
             tf_pts = np.concatenate(self.agg_pts)
-        # 2026-11-18 修复：scan 时间戳必须贴近"发布时刻"，而非聚合窗口首片。
-        # 首片 agg_t0 是主机收到点云的时刻（经无线中继已滞后 ~0.3s），加上 90ms
-        # 聚合窗口，scan.stamp 平均比 odom TF（odom_tf_bridge 贴本机 now 发布）
-        # 旧 0.36s。obstacle_layer 按 scan.stamp 查 odom->base_link_level 时，
-        # 该时刻已超出 costmap TF buffer 能回溯的范围，报 extrapolate-into-past
-        # 丢帧 -> 全局/局部 costmap 的 obstacle_layer 都吃不到 /scan，局部无
-        # static 掩盖即全 0（本次实测：559 个 scan 点位于局部窗内但命中全 0）。
-        # 改贴接近发布时刻：scan.stamp 与 odom TF 对齐，obstacle_layer 能查到
-        # TF 并正常标记。移动场景下点云几何用"到达时 TF"，与最新 stamp 的
-        # 错位 <0.4s*p（0.5m/s 时 <0.2m），由 costmap inflation_radius 0.55 兜底。
+        # scan 时间戳必须贴近"发布时刻"，而非聚合窗口首片。首片时刻是主机收到
+        # 点云的时刻（经无线中继已滞后 ~0.3s），若用它作 stamp，obstacle_layer
+        # 按 scan.stamp 查 odom->base_link_level 时会超出 TF buffer 回溯范围，
+        # 报 extrapolate-into-past 丢帧 -> costmap 吃不到 /scan。
+        # 贴发布时刻后 scan.stamp 与 odom TF 对齐，obstacle_layer 能查到 TF。
+        # 移动场景下点云几何用"到达时 TF"，与最新 stamp 的错位 <0.4s*v
+        # （0.5m/s 时 <0.2m），由 costmap inflation_radius 0.55 兜底。
         now = self.get_clock().now()
         stamp = (now - Duration(seconds=0.04)).to_msg()
-        self.agg_pts, self.agg_n, self.agg_t0, self.agg_wall = [], 0, None, None
+        self.agg_pts, self.agg_n, self.agg_wall = [], 0, None
 
         # 高度带过滤 -> 极坐标
         mask = (tf_pts[:, 2] >= self.zmin) & (tf_pts[:, 2] <= self.zmax)

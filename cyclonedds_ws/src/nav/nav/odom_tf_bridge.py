@@ -11,10 +11,12 @@ Go2 真机里程计 TF 桥接节点。
                               使 2D 切片平面始终与地面平行：
                               机器狗行走时机身俯仰不会让地面点混入 /scan。
 
-TF 时间戳统一重打为本机时钟：robot_odom 的 stamp 属狗主控时钟域（慢约 163 天），
-而 AMCL/Nav2/RViz 用本机 now() 查 TF，跨域查询会报 "Transform data too old"。
+TF 时间戳统一重打为本机时钟：robot_odom 的 stamp 属狗主控时钟域，与笔记本时钟
+不同步时，AMCL/Nav2/RViz 用本机 now() 查 TF 会报 "Transform data too old"。
 位姿值不变、仅重打 stamp（150Hz 高频下与采样时刻偏差仅数 ms）；下游 livox_scan
 的 /scan stamp 也统一到本机时钟，全链路（TF/scan/AMCL/Nav2）同源自洽。
+（狗时钟现已用 sync_dog_clock.py 对齐，但重打 stamp 仍保留：狗重启后 RTC
+可能再次漂移，由本节点保证 Nav2 始终拿到同源时间戳。）
 """
 import math
 
@@ -36,9 +38,9 @@ class OdomTfBridge(Node):
         self.declare_parameter('publish_level_frame', True)
         # 发布本机时钟重打版 Odometry 到 /odom_local，供 Nav2 controller_server/
         # bt_navigator 的 odom_topic 订阅——狗端 /utlidar/robot_odom 的 stamp 属
-        # 狗主控时钟域（启动时 epoch ~33天），与本机 TF/scan 时间不同步，
-        # Nav2 MessageFilter 按本机时钟过滤会全部丢弃 -> DWB 拿不到当前速度 -> 不走。
-        # 即使时钟已 SSH 同步，重启后狗可能再次漂移，此桥保证始终同源。
+        # 狗主控时钟域，与本机 TF/scan 时间不同步时，Nav2 MessageFilter 按本机
+        # 时钟过滤会全部丢弃 -> DWB 拿不到当前速度 -> 不走。
+        # 即使时钟已同步，重启后狗可能再次漂移，此桥保证始终同源。
         self.declare_parameter('publish_local_odom', True)
 
         odom_topic = self.get_parameter('odom_topic').value

@@ -2,7 +2,7 @@
 #
 # TF 链：map --(AMCL)--> odom --(odom_tf_bridge)--> base_link / base_link_level
 # /scan 的 frame 为 base_link_level，故 AMCL 的 base_frame_id 必须取它。
-# 所有时间戳均来自机器人时钟（scan 与 odom 同源），主机时钟慢 ~124 天无影响。
+# scan 与 odom 的 stamp 均由桥接节点重打为本机时钟，两者同源。
 
 map_server:
   ros__parameters:

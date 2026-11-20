@@ -48,7 +48,7 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration('use_rviz')
     map_yaml = LaunchConfiguration('map')
 
-    # 1. Mid360 点云切片（与建图管线一致：stamp 对齐狗主控时钟域 + 去俯仰水平切片）
+    # 1. Mid360 点云切片（stamp 重打为本机时钟 + 去俯仰水平切片）
     livox_scan = Node(
         package='nav',
         executable='livox_scan.py',
@@ -57,10 +57,15 @@ def generate_launch_description():
         # 2026-11-20：狗端 Mid360 驱动又回到 ~600Hz 小切片突发模式（60 片/帧），
         # 聚合窗口 0 时每片直接发一条 /scan，实测 459Hz -> AMCL/costmap 被淹没
         # -> map->odom 停更 -> controller_server 刷 "Transform data too old"
-        # -> DWB 拿不到位姿，狗不动。重开 90ms 窗口把切片凑回 ~10Hz。
-        # 若狗端驱动恢复整帧直发（帧间隔 57~366ms），此窗口会把间隔 <90ms 的
-        # 两帧并成一帧（频率降至 ~3-8Hz，仍可用）；根治办法是狗端改回整帧。
-        parameters=[{'aggregate_window_sec': 0.09}],
+        # -> DWB 拿不到位姿，狗不动。
+        # 窗口取值（0.09->0.2）：实测切片按帧成簇突发（~60 片/34ms 簇，簇周期
+        # ~130ms）。90ms < 簇周期，部分窗口只撞上簇的零头 -> 该条 scan 只盖住
+        # 一小角扇区、其余 bins 全 inf -> costmap clearing 把"无回波"当自由
+        # 空间清理，盲区里的障碍被抹掉（局部代价地图障碍时有时无）。
+        # 0.2s >= 簇周期+簇时长，保证每条 scan 必含一个完整簇（360° 全覆盖），
+        # /scan 稳定 ~5Hz。整帧直发模式下只是把相邻两帧并一帧，无害。
+        # 根治：狗端驱动改回整帧直发（见 docs/scan-rate-spike-diagnosis.md）。
+        parameters=[{'aggregate_window_sec': 0.2}],
     )
 
     # Mid360 安装位静态 TF：背部官方支架，雷达向下倾 13°。

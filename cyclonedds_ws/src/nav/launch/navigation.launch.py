@@ -20,11 +20,10 @@ Go2 导航启动文件：定位（AMCL）+ costmap 组件（全局/局部代价�
         planner_server    -> 全局代价地图 /global_costmap/costmap + /plan
         behavior_server   -> 恢复行为（仅 spin/wait，禁 backup 倒车）
         bt_navigator      -> 行为树导航器，接收 /goal_pose 自动规划+避障
-        collision_monitor -> /scan 实时减速/急停（DWB 与运动桥之间的安全层）
-        lifecycle_manager_navigation 自动激活上述五个节点
+        lifecycle_manager_navigation 自动激活上述四个节点
     运动桥接：
         cmd_vel_sport_bridge -> /cmd_vel 转 1008 MOVE（vx>=0 硬约束 + 看门狗）
-        速度链路：DWB /cmd_vel_raw -> collision_monitor -> /cmd_vel -> 运动桥
+        速度链路：DWB -> /cmd_vel -> 运动桥（无 collision_monitor）
 
 自动导航用法（定位初始化后）：
     RViz 工具栏 "2D Goal Pose" 在地图上点目标 -> 狗自动规划路径并绕障走过去
@@ -36,8 +35,7 @@ Go2 导航启动文件：定位（AMCL）+ costmap 组件（全局/局部代价�
 验证：
     ros2 topic hz /local_costmap/costmap      # ~1Hz（publish_frequency）
     ros2 topic hz /global_costmap/costmap     # ~0.5Hz
-    ros2 topic echo /cmd_vel_raw              # 导航时有输出（DWB 原始指令）
-    ros2 topic echo /cmd_vel                  # collision_monitor 裁剪后指令
+    ros2 topic echo /cmd_vel                  # 导航时有输出（DWB 指令，vx>=0）
     RViz 中 Global/Local Costmap 显示层随狗移动刷新障碍物
 """
 import os
@@ -65,8 +63,7 @@ def generate_launch_description():
         launch_arguments={'use_rviz': 'false', 'map': map_yaml}.items())
 
     # 2. 控制服务器（承载局部代价地图 + DWB 控制器）
-    #    2026-11-18 去掉 collision_monitor（动态避障），DWB 直接输出 /cmd_vel
-    #    供 cmd_vel_sport_bridge 订阅，不再经雷达急停层裁剪。
+    #    DWB 直接输出 /cmd_vel 供 cmd_vel_sport_bridge 订阅
     controller_server = Node(
         package='nav2_controller',
         executable='controller_server',
@@ -113,8 +110,6 @@ def generate_launch_description():
     )
 
     # 7. cmd_vel -> 1008 MOVE 桥接（DWB 直接输出 /cmd_vel，Go2 只认 1008）
-    #    2026-11-18 去掉 collision_monitor 与 scan_to_cloud（动态避障/对照实验），
-    #    DWB 直接喂桥接，只做"沿全局地图路径行走"。
     #    含 vx>=0 硬约束 + 限幅 + 0.5s 断流看门狗停车
     cmd_vel_bridge = Node(
         package='nav',

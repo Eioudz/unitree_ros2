@@ -4,49 +4,25 @@
 # /scan 由 livox_scan.py 产出（frame: base_link_level，range_min=0.55 已屏蔽前腿自点）
 # 全部时间戳为本机时钟域（见 livox_scan.py 头注释），Nav2 查 TF 同源自洽。
 #
-# CPU 预算（沿用 2026-11-04 降载结论，避免 cmd_vel 断续）：
-#   DWB 10Hz + 10x20 轨迹采样 + 1.5s 仿真时间（约为默认配置负载的 1/14）
+# 速度链路：DWB -> /cmd_vel -> cmd_vel_sport_bridge -> 1008 MOVE（无 collision_monitor）
+#
+# 禁倒车（vx>=0）四处联动，缺一处就会被绕过：
+#   DWB min_vel_x: 0.0 / 桥 min_vx: 0.0 / behavior_plugins 无 backup /
+#   行为树无 <BackUp>（behavior_trees/*_no_backup.xml）
+#
+# CPU 预算（2026-11-04 降载结论，避免 cmd_vel 断续）：
+#   DWB 10Hz + 6x16 轨迹采样 + 3.0s 仿真时间
 #   局部 costmap 2Hz 更新 / 1Hz 发布；全局 costmap 1Hz 更新 / 0.5Hz 发布
 #
-# 速度链路（2026-11-11 加入 Collision Monitor）：
-#   DWB -> /cmd_vel_raw -> collision_monitor(减速/急停) -> /cmd_vel
-#   -> cmd_vel_sport_bridge -> 1008 MOVE
-#   collision_monitor 直接订阅 /scan（~10Hz），不排队等 costmap 2Hz 更新，
-#   补上"动态障碍两帧间位移 0.6m"的反应盲区；近身 <0.55m 盲区由狗固件超声兜底。
+# 避障分层（全局宽绕行、局部精执行）：
+#   - 全局 costmap：只用静态图 + inflation 0.55，robot_radius 0.39（=局部矩形
+#     外接圆 √(0.35²+0.16²)），路径提前弯出宽绕行线；
+#   - 局部 costmap：矩形 footprint 0.70x0.32，static + obstacle(/scan) + inflation，
+#     DWB 用 ObstacleFootprint critic 按轮廓查碰撞，0.35m+ 缝隙可通过；
+#   - 恢复行为只有 spin/wait，贴脸障碍靠原地转向换方向，不倒车。
 #
-# 动态绕障（2026-11-16 调整，对齐"雷达发现障碍入图 -> 膨胀 -> 重规划绕行"）：
-#   此前实测（11-13 session）遇未建图障碍只会顶停：costmap/规划均正常
-#   （planner 全程无 WARN），败在执行层三重冲突——DWB 代价梯度太薄
-#   （inflation 0.45 + obstacle critic scale 0.1，贴障碍与绕行同分）被
-#   collision_monitor Stop 区冻结；Stop 区宽 ±0.3 覆盖了 DWB 合法通过带；
-#   spin 恢复按 acc 1.5 下发而固件实际 ~0.04rad/s²，10s 限时必超时。
-#   分层修正（全局宽绕行、局部精执行、monitor 只兜底）：
-#   - 全局：global_costmap 保持外接圆 robot_radius 0.39（=局部矩形外接圆，
-#     与 11-16 精度修正保持一致）+ inflation 0.45->0.55，路径提前弯出宽绕行线；
-#   - 局部：local_costmap 改矩形 footprint（0.35x0.16 外接，按狗真实体型），
-#     DWB 换 ObstacleFootprint critic（按轮廓查碰撞）scale 0.5，
-#     inflation 0.45->0.55，0.35m+ 缝隙可通过；
-#   - monitor：Stop/Slow 侧向宽度收窄（±0.3->±0.22 / ±0.45->±0.35），前沿
-#     不动（正面急停/减速保护不变），不再误杀侧向绕行；
-#   - spin：acc 1.5->0.1、max_vel 0.4->0.25，BT spin_dist 1.57->1.0，
-#     按固件真实转速下发，10s 限时内约 5.3s 完成。
-#
-# 转速修正（2026-11-16 二次调整，此前"固件加速仅 0.04rad/s²"的结论不成立）：
-#   11-03/11-04/11-06 的 behavior_server 日志里，同样 1.57rad 的 spin 只用了
-#   2.9~4.3s（平均 0.36~0.54rad/s），说明固件能转这么快；而 11-14 把 spin
-#   降到 0.25rad/s + acc 0.1 后，11-14/11-16 的 spin 反而全部 10s 超时
-#   （低速指令很可能低于固件原地转向的有效下限，被直接忽略）。
-#   现恢复转速：DWB/monitor 上限 0.4->0.8，spin 0.6rad/s、acc 0.8、
-#   min 0.25（避免下发无效低速），BT spin_dist 维持 1.0。
-#
-# 提速（2026-11-17）：导航整体太慢，线速度 0.25->0.5m/s、角速度 0.8->1.2rad/s：
-#   - DWB：max_vel_x/max_speed_xy -> 0.5，max_vel_theta -> 1.2；
-#   - cmd_vel_sport_bridge：max_vx/max_wz 默认值同步抬高（否则桥限幅把
-#     DWB 的新上限掐死，提速无效）；
-#   - sim_time 3.0 与采样数 6x16 不动：前瞻随速度自动放大到 0.5*3.0=1.5m
-#     （> 0.8m 安全边），轨迹点数按 6*16*3.0 计与 11-04 已验证负载同量级；
-#   - collision_monitor 不动：slowdown ratio 0.5，贴障减速后 0.25m/s
-#     （= 原全速），安全层不放松。
+# 转速：固件原地转向有效下限约 0.25rad/s（低于它指令被忽略），故 spin 取
+#   0.6rad/s + acc 0.8 + min 0.25，1.0rad 约 2.5s 完成。
 
 controller_server:
   ros__parameters:
