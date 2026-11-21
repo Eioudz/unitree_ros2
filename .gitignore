@@ -3,4 +3,12 @@
 **/__pycache__/
 **/log/
 **/install/
-.cache
+cyclonedds_ws/src/cyclonedds/
+cyclonedds_ws/src/rmw_cyclonedds/
+cyclonedds_ws/build/
+cyclonedds_ws/install/
+cyclonedds_ws/log/
+__pycache__/
+*.tar.gz
+frames_*.gv
+frames_*.pdf

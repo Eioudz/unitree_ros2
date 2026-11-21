@@ -1,0 +1,102 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.5
+    Tree Height: 600
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 0.5
+      Color: 160; 160; 160
+      Line Style: Lines
+      Plane Cell Count: 20
+      Normal Cell Count: 0
+      Reference Frame: <Root Frame>
+    - Class: rviz_default_plugins/RobotModel
+      Enabled: true
+      Name: RobotModel
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Mass Property Enabled: false
+      Inertia Enabled: false
+      Links:
+        All Links Enabled: true
+      Robot Description: robot_description
+      TF Prefix: ""
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Marker Scale: 0.3
+      Show Axes: true
+      Show Names: false
+      Tree:
+        Tree Height: 400
+    - Class: rviz_default_plugins/Image
+      Enabled: false
+      Name: Image
+      Topic:
+        Depth: 5
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+        Durability Policy: Volatile
+        Value: /image
+      Transport Hint: raw
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: PointCloud2
+      Topic:
+        Depth: 5
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+        Durability Policy: Volatile
+        Value: /utlidar/cloud_base
+      Color: 255; 25; 0
+      Size (Pixels): 3
+      Style: Points
+      Alpha: 1
+      Decay Time: 0
+      Color Transformer: AxisColor
+      Axis: Z
+      Max Value: 1.0
+      Min Value: -0.2
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed: true
+      Focal Size: 0.05
+      Invert Z: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.5
+      Target Frame: base
+      Yaw: 0.5
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1400
+  X: 100
+  Y: 100

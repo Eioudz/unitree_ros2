@@ -1,0 +1,96 @@
+# slam_toolbox online_async 建图参数（Go2 实验室建图）
+# 基于 /opt/ros/humble/share/slam_toolbox/config/mapper_params_online_async.yaml 修改：
+#   - base_frame/scan 坐标系改为 base_link_level（去俯仰虚拟坐标系，见 odom_tf_bridge.py）
+#   - min_laser_range 0.55：避开机器狗自身前腿（约 0.52m 处）
+#   - max_laser_range 12：实验室尺度
+#   - minimum_travel_* 0.3：实验室较小，图节点更密
+#   - map_update_interval 2.0→0.5：RViz 里黑点(地图)跟随黄点(扫描)更实时
+#   - 2026-10-27 第二轮（转弯后偏移）：heading 0.15→0.1、travel 0.3→0.2、
+#     匹配缓冲 10→20、参考窗 1.5→2.0、顺序链路响应阈值 0.1→0.05，详见行内注释
+slam_toolbox:
+  ros__parameters:
+
+    # Plugin params
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: HuberLoss
+
+    # ROS Parameters
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link_level
+    scan_topic: /scan
+    use_map_saver: true
+    mode: mapping
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02
+    # 0.5：/map 发布周期，RViz"黄点→黑点"的刷新节奏由它决定；2.0 时黑点
+    # 固定滞后最多 2s+，0.5 基本跟手（本机发布，带宽/CPU 无压力；若 RViz 卡可回调 1.0）
+    map_update_interval: 0.5
+    # 0.03：实验室尺度下内存/CPU 可接受，墙线更细，下游 AMCL 同样受益
+    resolution: 0.03
+    min_laser_range: 0.55
+    max_laser_range: 12.0
+    # 0.09：Mid360 源 10Hz（帧间隔 0.1s），闸门必须小于它，否则每 0.15s 才
+    # 处理一帧、10Hz 被砍半成 5Hz；切回 utlidar 源时中继 /scan ~4.8Hz（周期
+    # 0.21s），0.09 同样不丢帧（原 0.15 也是为它设的）
+    minimum_time_interval: 0.09
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.
+    stack_size_to_use: 40000000
+    enable_interactive_mode: true
+
+    # General Parameters
+    use_scan_matching: true
+    use_scan_barycenter: true
+    # 0.2：转完弯后 0.2m 行走内即重新加节点纠偏，缩短"纯里程计裸奔"区段
+    minimum_travel_distance: 0.2
+    # 0.1(±5.7°)：旋转是里程计漂移最快的阶段；0.5rad/s 转弯时约 0.2s 就加一个
+    # 约束节点，两次匹配间需桥接的旋转量小、扫描匹配更容易咬合
+    minimum_travel_heading: 0.1
+    # 20：抽点后每帧 /scan 很稀疏；原地旋转时近邻扫描距离≈0、不受距离窗限制，
+    # 数量是唯一瓶颈，加倍后叠加出的参考网格更密、匹配响应更高
+    scan_buffer_size: 20
+    scan_buffer_maximum_scan_distance: 10.0
+    # 0.05：抽点扫描整体响应偏低；原阈值下弱匹配会被判"不可信"而退回纯
+    # 里程计位姿，转弯误差原样写进地图（弱匹配协方差大，图优化会自动降权）
+    link_match_minimum_response_fine: 0.05
+    # 2.0：直线段上参考扫描窗 1.5m 只够收 ~7 帧，配合 buffer 20 放宽到 2.0m
+    link_scan_maximum_distance: 2.0
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    # 8：中继下点云稀疏，链稍短即可成环，二次经过更容易咬合
+    loop_match_minimum_chain_size: 8
+    loop_match_maximum_variance_coarse: 3.0
+    # 0.25/0.30：抽点扫描匹配响应整体偏低，阈值放松避免回环"够不着"
+    loop_match_minimum_response_coarse: 0.25
+    loop_match_minimum_response_fine: 0.30
+
+    # Correlation Parameters
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # Correlation Parameters - Loop Closure
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # Scan Matcher Parameters
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    # 0.5(±28.6°)：转弯时两帧间姿态角更大，搜索范围需覆盖，否则粗匹配局部收敛
+    coarse_search_angle_offset: 0.5
+    # 0.0175(1°)：粗搜索角度分辨率翻倍，角度匹配更准（代价是搜索略慢）
+    coarse_angle_resolution: 0.0175
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    min_pass_through: 2
+    occupancy_threshold: 0.1
